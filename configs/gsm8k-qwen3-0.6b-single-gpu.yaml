@@ -1,0 +1,93 @@
+base:
+  trainer:
+    total_steps: 100
+    seed: 42
+    log_freq: 1
+    mode: sync
+
+  algorithm:
+    adv_estimator: grpo
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    beta: 0.0
+    entropy_coef: 0.0
+
+  data:
+    train_files: data/gsm8k/train.parquet
+    val_files: data/gsm8k/test.parquet
+    prompt_key: question
+    prompt_template: "{question} Please provide your final answer in \\boxed{{}}."
+    train_batch_size: 256
+    max_prompt_length: 1024
+    max_response_length: 4096
+
+  model:
+    path: Qwen/Qwen3-0.6B
+
+  actor:
+    world_size: 1
+
+  rollout:
+    n: 4
+    temperature: 1
+    top_p: 1
+
+  weight_sync:
+    backend: naive
+    bucket_size_mb: 512
+
+  logging:
+    logger: console
+    output_dir: logs/gsm8k-qwen3-0.6b-single-gpu
+    project_name: nanoverl
+    experiment_name: gsm8k-qwen3-0.6b-single-gpu
+
+  checkpoint:
+    dir: checkpoints/gsm8k-qwen3-0.6b-single-gpu
+    save_freq: 25
+    resume: false
+
+  reward:
+    custom_reward_function:
+      path: nanoverl/reward/reward.py
+      name: compute_score
+
+advanced:
+  data:
+    shuffle: true
+    random_sample: false
+    seed: 42
+    num_workers: 0
+
+  model:
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+
+  actor:
+    optim:
+      lr: 1.0e-6
+    fsdp:
+      optimizer_offload: false
+      model_dtype: bfloat16
+      mix_precision: bfloat16
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 4
+    use_dynamic_bsz: false
+    skip_zero_response_update: false
+
+  rollout:
+    name: vllm
+    mode: hybrid
+    dtype: bfloat16
+    batch_size: 256
+    log_prob_micro_batch_size_per_gpu: 8
+    log_prob_use_dynamic_bsz: false
+    gpu_memory_utilization: 0.75
+    colocate_with_actor: false
+    free_cache_engine: false
+    tensor_model_parallel_size: 1
+
+  reward:
+    kwargs:
+      num_examine: 2
+      num_workers: 1

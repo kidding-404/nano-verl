@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoverl"
+version = "0.1.0"
+description = "A compact educational RL infra for GRPO training."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch==2.10.0",
+  "transformers>=4.45.0",
+  "datasets>=2.20.0",
+  "huggingface_hub>=0.30.0",
+  "pyarrow>=15.0.0",
+  "pyyaml>=6.0.0",
+  "pyzmq>=25.0.0",
+  "ray>=2.20.0",
+  "vllm>=0.8.0",
+  "swanlab>=0.7.0",
+  "tensorboard>=2.17.0",
+  "accelerate>=1.0.0",
+  "safetensors>=0.4.0",
+  "sentencepiece>=0.2.0",
+  "math-verify>=0.9.0",
+]
+
+[project.scripts]
+nanoverl-train = "nanoverl.main:main"
+
+[tool.setuptools]
+packages = [
+  "nanoverl",
+  "nanoverl.actor",
+  "nanoverl.rollout",
+  "nanoverl.reward",
+  "nanoverl.trainer",
+  "nanoverl.datasets",
+]

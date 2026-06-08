@@ -1,0 +1,42 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging and build artifacts
+*.egg-info/
+build/
+dist/
+
+# Local tooling and editor state
+.agents/
+.codex/
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime artifacts
+logs/
+*.log
+outputs/
+checkpoints/
+swanlog/
+
+# Downloaded model artifacts
+model/
+
+# Non-repository project paths
+experiment/
+scripts/
+tests/
+uv.lock
