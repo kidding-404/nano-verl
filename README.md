@@ -17,7 +17,7 @@ A lightweight verl-style RL training framework implemented from scratch.
 1. Clone the code:
 
 ```bash
-git clone 
+git clone https://github.com/kidding-404/nano-verl.git
 cd nano-verl
 ```
 
