@@ -14,7 +14,7 @@
 
 1. 下载代码：
 ```bash
-git clone 
+git clone https://github.com/kidding-404/nano-verl.git
 cd nano-verl
 ```
 
