@@ -4,7 +4,7 @@
 
 [中文版](README_CN.md)
 
-A lightweight `verl`-style RL training framework implemented from scratch.
+A lightweight verl-style RL training framework implemented from scratch.
 
 ## Core Features
 
