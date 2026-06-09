@@ -241,6 +241,8 @@ class RolloutManager:
             }
             if rollout_cfg.ray_address:
                 init_kwargs["address"] = rollout_cfg.ray_address
+            else:
+                init_kwargs["num_gpus"] = int(config.resources.gpus_per_node)
             ray.init(**init_kwargs)
 
         if rollout_cfg.mode.lower().strip() == "hybrid":

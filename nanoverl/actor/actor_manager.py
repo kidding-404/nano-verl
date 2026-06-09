@@ -35,7 +35,7 @@ def apply_ray_worker_env_defaults() -> None:
     apply_fsdp_worker_env_defaults()
 
 
-def _ensure_ray_initialized(address: str | None, namespace: str) -> None:
+def _ensure_ray_initialized(address: str | None, namespace: str, num_gpus: int | None = None) -> None:
     if ray.is_initialized():
         return
     apply_ray_worker_env_defaults()
@@ -46,6 +46,8 @@ def _ensure_ray_initialized(address: str | None, namespace: str) -> None:
     }
     if address:
         init_kwargs["address"] = address
+    elif num_gpus is not None:
+        init_kwargs["num_gpus"] = int(num_gpus)
     ray.init(**init_kwargs)
 
 
@@ -93,7 +95,11 @@ class ActorManager:
         tokenizer: Any,
         backend_cfg: dict | None = None,
     ) -> "ActorManager":
-        _ensure_ray_initialized(config.rollout.ray_address, config.rollout.ray_namespace)
+        _ensure_ray_initialized(
+            config.rollout.ray_address,
+            config.rollout.ray_namespace,
+            num_gpus=config.resources.gpus_per_node,
+        )
         resources = config.resources
         node_ids = _resource_gpu_node_ids(resources.nodes, resources.gpus_per_node)
         actor_node_ids = node_ids[: resources.actor_nodes]
