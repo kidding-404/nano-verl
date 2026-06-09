@@ -17,15 +17,18 @@ base:
     val_files: data/gsm8k/test.parquet
     prompt_key: question
     prompt_template: "{question} Please provide your final answer in \\boxed{{}}."
-    train_batch_size: 256
+    train_batch_size: 32
     max_prompt_length: 1024
     max_response_length: 4096
 
   model:
     path: Qwen/Qwen3-0.6B
 
-  actor:
-    world_size: 1
+  resources:
+    nodes: 1
+    gpus_per_node: 1
+
+  actor: {}
 
   rollout:
     n: 4
@@ -83,9 +86,8 @@ advanced:
     log_prob_micro_batch_size_per_gpu: 8
     log_prob_use_dynamic_bsz: false
     gpu_memory_utilization: 0.75
-    colocate_with_actor: false
-    free_cache_engine: false
-    tensor_model_parallel_size: 1
+    free_cache_engine: true
+    tensor_parallel_size: 1
 
   reward:
     kwargs:

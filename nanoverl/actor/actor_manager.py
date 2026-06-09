@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nanoverl.actor.fsdp_worker import FSDPActorWorker
 from nanoverl.config import SystemConfig
@@ -48,10 +49,42 @@ def _ensure_ray_initialized(address: str | None, namespace: str) -> None:
     ray.init(**init_kwargs)
 
 
+def _resource_gpu_node_ids(nodes: int, gpus_per_node: int) -> list[str]:
+    node_ids: list[str] = []
+    gpu_counts: list[str] = []
+    for node in ray.nodes():
+        if not node.get("Alive", False):
+            continue
+        resources = node.get("Resources") or {}
+        gpu_count = int(float(resources.get("GPU", 0)))
+        node_id = node.get("NodeID")
+        if node_id is None:
+            continue
+        if gpu_count > 0:
+            gpu_counts.append(f"{node_id}:{gpu_count}")
+        if gpu_count >= gpus_per_node:
+            node_ids.append(str(node_id))
+    if len(node_ids) < nodes:
+        available = ", ".join(gpu_counts) or "none"
+        raise ValueError(
+            f"Ray has {len(node_ids)} GPU node(s) with at least {gpus_per_node} GPU(s), "
+            f"but resources.nodes requires {nodes}; available GPU nodes: {available}"
+        )
+    return node_ids[:nodes]
+
+
 class ActorManager:
-    def __init__(self, workers: list[Any], dp_size: int | None = None) -> None:
+    def __init__(
+        self,
+        workers: list[Any],
+        dp_size: int | None = None,
+        local_ranks: list[int] | None = None,
+        local_world_sizes: list[int] | None = None,
+    ) -> None:
         self.workers = list(workers)
         self.dp_size = int(dp_size if dp_size is not None else len(self.workers))
+        self.local_ranks = list(local_ranks or [0 for _ in self.workers])
+        self.local_world_sizes = list(local_world_sizes or [1 for _ in self.workers])
 
     @classmethod
     def launch(
@@ -61,23 +94,43 @@ class ActorManager:
         backend_cfg: dict | None = None,
     ) -> "ActorManager":
         _ensure_ray_initialized(config.rollout.ray_address, config.rollout.ray_namespace)
-        world_size = int(config.distributed.world_size)
-        if world_size != int(config.distributed.dp_size):
-            raise ValueError("Ray actor training currently requires distributed.world_size == distributed.dp_size")
+        resources = config.resources
+        node_ids = _resource_gpu_node_ids(resources.nodes, resources.gpus_per_node)
+        actor_node_ids = node_ids[: resources.actor_nodes]
         worker_options: dict[str, Any] = {
             "num_cpus": float(config.actor.ray_num_cpus_per_worker),
+            "num_gpus": 1.0,
         }
-        if config.actor.ray_num_gpus_per_worker > 0:
-            worker_options["num_gpus"] = float(config.actor.ray_num_gpus_per_worker)
         remote_worker_cls = ray.remote(FSDPActorWorker)
-        workers = [
-            remote_worker_cls.options(**worker_options).remote(
-                tokenizer=tokenizer,
-                backend_cfg=backend_cfg,
+        workers: list[Any] = []
+        local_ranks: list[int] = []
+        local_world_sizes: list[int] = []
+        local_world_size = int(resources.actor_gpus_per_node)
+        for node_id in actor_node_ids:
+            for local_rank in range(local_world_size):
+                options = dict(worker_options)
+                options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                    node_id=node_id,
+                    soft=False,
+                )
+                workers.append(
+                    remote_worker_cls.options(**options).remote(
+                        tokenizer=tokenizer,
+                        backend_cfg=backend_cfg,
+                    )
+                )
+                local_ranks.append(local_rank)
+                local_world_sizes.append(local_world_size)
+        if len(workers) != resources.actor_world_size:
+            raise RuntimeError(
+                f"expected {resources.actor_world_size} actor worker(s), launched {len(workers)}"
             )
-            for _ in range(world_size)
-        ]
-        return cls(workers, dp_size=config.distributed.dp_size)
+        return cls(
+            workers,
+            dp_size=resources.actor_world_size,
+            local_ranks=local_ranks,
+            local_world_sizes=local_world_sizes,
+        )
 
     def init_model(self, config: Any) -> None:
         if not self.workers:
@@ -92,8 +145,8 @@ class ActorManager:
                     world_size=len(self.workers),
                     master_addr=master_addr,
                     master_port=master_port,
-                    local_rank=0,
-                    local_world_size=1,
+                    local_rank=self.local_ranks[rank],
+                    local_world_size=self.local_world_sizes[rank],
                 )
             )
         ray.get(futures)

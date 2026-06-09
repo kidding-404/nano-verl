@@ -448,7 +448,9 @@ class FSDPActorWorker:
             timeout = timedelta(seconds=int(self.system_cfg.actor.distributed_init_timeout_seconds))
             dist.init_process_group(backend=backend, rank=self.rank, world_size=self.world_size, timeout=timeout)
         if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{self.local_rank}")
+            visible_devices = [item for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if item]
+            device_index = 0 if len(visible_devices) == 1 else self.local_rank
+            self.device = torch.device(f"cuda:{device_index}")
             torch.cuda.set_device(self.device)
 
     def _load_model(self) -> None:

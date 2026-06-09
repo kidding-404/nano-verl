@@ -17,12 +17,19 @@ _CONFIG_ALIAS_PATHS = {
     "actor": ("system", "actor"),
     "rollout": ("system", "rollout"),
     "weight_sync": ("system", "sync"),
+    "resources": ("system", "resources"),
 }
 
 
 def _require_positive(name: str, value: int | float) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
+
+
+def _require_positive_int(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be a positive integer, got {value!r}")
+    _require_positive(name, value)
 
 
 def _require_non_empty(name: str, value: str) -> None:
@@ -50,6 +57,13 @@ def _require_sections(config: dict[str, Any], *sections: str) -> None:
     missing = [section for section in sections if section not in config]
     if missing:
         raise ValueError(f"Config is missing required section(s): {', '.join(missing)}")
+
+
+def _reject_keys(config: dict[str, Any], path: str, keys: set[str]) -> None:
+    present = sorted(set(config) & keys)
+    if present:
+        joined = ", ".join(f"{path}.{key}" for key in present)
+        raise ValueError(f"{joined} has been removed; configure GPU resources under resources instead")
 
 
 def _section_maps(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -258,13 +272,94 @@ class ModelConfig:
 
 
 @dataclass
-class DistributedConfig:
-    world_size: int = 1
-    dp_size: int = 1
+class RoleResourcesConfig:
+    nodes: int = 1
+    gpus_per_node: int = 1
 
-    def validate(self) -> None:
-        _require_positive("actor.world_size", self.world_size)
-        _require_positive("actor.dp_size", self.dp_size)
+    @classmethod
+    def from_dict(cls, config: dict[str, Any] | None, path: str) -> "RoleResourcesConfig":
+        return cls(**_as_mapping(config, path))
+
+    def validate(self, path: str) -> None:
+        _require_positive_int(f"{path}.nodes", self.nodes)
+        _require_positive_int(f"{path}.gpus_per_node", self.gpus_per_node)
+
+
+@dataclass
+class ResourcesConfig:
+    nodes: int = 1
+    gpus_per_node: int = 1
+    actor: RoleResourcesConfig | None = None
+    rollout: RoleResourcesConfig | None = None
+    actor_nodes: int = field(init=False, default=1)
+    actor_gpus_per_node: int = field(init=False, default=1)
+    actor_world_size: int = field(init=False, default=1)
+    rollout_nodes: int = field(init=False, default=1)
+    rollout_gpus_per_node: int = field(init=False, default=1)
+    rollout_servers_per_node: int = field(init=False, default=1)
+    rollout_world_size: int = field(init=False, default=1)
+
+    @classmethod
+    def from_dict(cls, config: dict[str, Any]) -> "ResourcesConfig":
+        resources = dict(config)
+        if "actor" in resources:
+            resources["actor"] = RoleResourcesConfig.from_dict(resources["actor"], "resources.actor")
+        if "rollout" in resources:
+            resources["rollout"] = RoleResourcesConfig.from_dict(resources["rollout"], "resources.rollout")
+        return cls(**resources)
+
+    def validate_base(self) -> None:
+        _require_positive_int("resources.nodes", self.nodes)
+        _require_positive_int("resources.gpus_per_node", self.gpus_per_node)
+
+    def resolve(self, rollout_mode: str, tensor_parallel_size: int) -> None:
+        self.validate_base()
+        _require_positive_int("rollout.tensor_parallel_size", tensor_parallel_size)
+        mode = _normalize_choice("rollout.mode", rollout_mode, {"hybrid", "standalone"})
+
+        if mode == "hybrid":
+            if self.actor is not None or self.rollout is not None:
+                raise ValueError(
+                    "resources.actor and resources.rollout are not allowed when rollout.mode='hybrid'; "
+                    "hybrid uses all GPUs from resources"
+                )
+            self.actor_nodes = self.nodes
+            self.actor_gpus_per_node = self.gpus_per_node
+            self.rollout_nodes = self.nodes
+            self.rollout_gpus_per_node = self.gpus_per_node
+        else:
+            if self.actor is None or self.rollout is None:
+                raise ValueError(
+                    "rollout.mode='standalone' requires resources.actor and resources.rollout"
+                )
+            self.actor.validate("resources.actor")
+            self.rollout.validate("resources.rollout")
+            if self.actor.nodes != self.nodes or self.rollout.nodes != self.nodes:
+                raise ValueError(
+                    "standalone resources require resources.actor.nodes == "
+                    "resources.rollout.nodes == resources.nodes"
+                )
+            total_gpus = self.actor.gpus_per_node + self.rollout.gpus_per_node
+            if total_gpus > self.gpus_per_node:
+                raise ValueError(
+                    "standalone resources require resources.actor.gpus_per_node + "
+                    "resources.rollout.gpus_per_node <= resources.gpus_per_node; "
+                    f"got {total_gpus} > {self.gpus_per_node}"
+                )
+            self.actor_nodes = self.actor.nodes
+            self.actor_gpus_per_node = self.actor.gpus_per_node
+            self.rollout_nodes = self.rollout.nodes
+            self.rollout_gpus_per_node = self.rollout.gpus_per_node
+
+        if self.rollout_gpus_per_node % tensor_parallel_size != 0:
+            raise ValueError(
+                "rollout per-node GPU count must be divisible by rollout.tensor_parallel_size; "
+                f"got {self.rollout_gpus_per_node} and {tensor_parallel_size}"
+            )
+
+        self.actor_world_size = self.actor_nodes * self.actor_gpus_per_node
+        self.rollout_servers_per_node = self.rollout_gpus_per_node // tensor_parallel_size
+        self.rollout_world_size = self.rollout_nodes * self.rollout_servers_per_node
 
 
 @dataclass
@@ -291,7 +386,6 @@ class ActorConfig:
     use_fsdp: bool = True
     distributed_init_timeout_seconds: int = 1800
     ray_num_cpus_per_worker: float = 1.0
-    ray_num_gpus_per_worker: float = 1.0
     ppo_mini_batch_size: int = 256
     ppo_micro_batch_size_per_gpu: int = 16
     use_dynamic_bsz: bool = False
@@ -320,11 +414,6 @@ class ActorConfig:
         _require_positive("actor.ppo_micro_batch_size_per_gpu", self.ppo_micro_batch_size_per_gpu)
         if self.ppo_max_token_len_per_gpu is not None:
             _require_positive("actor.ppo_max_token_len_per_gpu", self.ppo_max_token_len_per_gpu)
-        if self.ray_num_gpus_per_worker <= 0:
-            raise ValueError(
-                "actor.ray_num_gpus_per_worker must be > 0, "
-                f"got {self.ray_num_gpus_per_worker}"
-            )
         self.fsdp_config.validate()
 
 
@@ -351,12 +440,10 @@ class RolloutConfig:
     log_prob_use_dynamic_bsz: bool = False
     log_prob_max_token_len_per_gpu: int | None = None
     gpu_memory_utilization: float | None = None
-    colocate_with_actor: bool = False
     sleep_level: int = 2
     ray_address: str | None = None
     ray_namespace: str = "nanoverl"
     ray_num_cpus_per_server: float = 1.0
-    ray_num_gpus_per_server: float | None = None
     weight_sync_bucket_mb: int = 16
     weight_sync_transport: str = "auto"
     weight_sync_defer_cache_clear: bool = True
@@ -370,7 +457,7 @@ class RolloutConfig:
     def validate(self) -> None:
         self.backend = _normalize_choice("rollout.name", self.backend, {"vllm"})
         self.mode = _normalize_choice("rollout.mode", self.mode, {"hybrid", "standalone"})
-        _require_positive("rollout.tensor_model_parallel_size", self.tensor_parallel_size)
+        _require_positive_int("rollout.tensor_parallel_size", self.tensor_parallel_size)
         self.seed = int(self.seed)
         if self.seed < 0:
             raise ValueError(f"rollout.seed must be non-negative, got {self.seed}")
@@ -392,11 +479,6 @@ class RolloutConfig:
                 f"got {self.gpu_memory_utilization}"
             )
         _require_non_empty("rollout.ray_namespace", self.ray_namespace)
-        if self.ray_num_gpus_per_server is not None and self.ray_num_gpus_per_server < 0:
-            raise ValueError(
-                "rollout.ray_num_gpus_per_server must be >= 0, "
-                f"got {self.ray_num_gpus_per_server}"
-            )
         _require_positive("weight_sync.bucket_size_mb", self.weight_sync_bucket_mb)
         _require_positive("weight_sync.bucket_size_mb", self.sync_bucket_size_mb)
         _require_non_empty("weight_sync.group_name", self.sync_group_name)
@@ -430,13 +512,14 @@ class SyncConfig:
 @dataclass
 class SystemConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
-    distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    resources: ResourcesConfig = field(default_factory=ResourcesConfig)
     actor: ActorConfig = field(default_factory=ActorConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
 
     def validate(self) -> None:
-        _validate_all(self.model, self.distributed, self.actor, self.rollout, self.sync)
+        _validate_all(self.model, self.actor, self.rollout, self.sync)
+        self.resources.resolve(self.rollout.mode, self.rollout.tensor_parallel_size)
 
 
 @dataclass
@@ -491,16 +574,17 @@ class Config:
         if not isinstance(config, dict):
             raise TypeError("Config root must be a mapping")
         config = _flatten_config_layers(config)
-        _require_sections(config, *_REQUIRED_SECTIONS)
-        if "resources" in config:
-            raise ValueError(
-                "resources section has been removed; configure actor.world_size "
-                "and actor.dp_size instead"
-            )
+        _require_sections(config, *_REQUIRED_SECTIONS, "resources")
+        if "distributed" in config:
+            raise ValueError("distributed has been removed; configure GPU resources under resources instead")
 
         sections = _section_maps(config)
         trainer, algorithm, data, model, actor, rollout = (sections[name] for name in _REQUIRED_SECTIONS)
         weight_sync, logging, checkpoint, reward = (sections[name] for name in _OPTIONAL_SECTIONS)
+
+        resources_cfg = ResourcesConfig.from_dict(_as_mapping(config.get("resources"), "resources"))
+        _reject_keys(actor, "actor", {"world_size", "dp_size", "ray_num_gpus_per_worker"})
+        _reject_keys(rollout, "rollout", {"ray_num_gpus_per_server", "tensor_model_parallel_size"})
 
         data_cfg = DataConfig(**data)
         _move_alias(algorithm, "name", "adv_estimator", "grpo")
@@ -525,7 +609,6 @@ class Config:
         model_cfg = ModelConfig(**model)
 
         _move_alias(rollout, "backend", "name", "vllm")
-        _move_alias(rollout, "tensor_parallel_size", "tensor_model_parallel_size", 1)
         engine_kwargs = _as_mapping(rollout.get("engine_kwargs"), "rollout.engine_kwargs")
         vllm_kwargs = _as_mapping(engine_kwargs.get("vllm"), "rollout.engine_kwargs.vllm")
         if "seed" not in rollout and "seed" in vllm_kwargs:
@@ -543,17 +626,11 @@ class Config:
         rollout.setdefault("sync_group_name", weight_sync.get("group_name", "default"))
         rollout.setdefault("sync_rebuild_group", weight_sync.get("rebuild_group", False))
 
-        actor_world_size = actor.pop("world_size", 1)
-        actor_dp_size = actor.pop("dp_size", actor_world_size)
-
         root = cls(
             experiment=experiment_cfg,
             system=SystemConfig(
                 model=model_cfg,
-                distributed=DistributedConfig(
-                    world_size=actor_world_size,
-                    dp_size=actor_dp_size,
-                ),
+                resources=resources_cfg,
                 actor=ActorConfig.from_dict(actor),
                 rollout=RolloutConfig(**rollout),
                 sync=SyncConfig(**weight_sync),

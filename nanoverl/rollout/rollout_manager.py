@@ -60,141 +60,84 @@ def _apply_vllm_server_env_defaults() -> None:
         os.environ[name] = str(default)
 
 
-def _required_gpus_per_server(config: RolloutConfig) -> float:
-    if config.ray_num_gpus_per_server is not None:
-        return float(config.ray_num_gpus_per_server)
-    return float(config.tensor_parallel_size)
+ServerLayout = tuple[str, str | None, float]
 
 
-def _active_gpu_node_ids(config: RolloutConfig) -> list[str]:
-    required_gpus = _required_gpus_per_server(config)
-    if required_gpus <= 0:
-        return []
-
-    node_ids: list[str] = []
+def _resource_gpu_nodes(nodes: int, gpus_per_node: int) -> list[tuple[str, dict[str, Any]]]:
+    selected: list[tuple[str, dict[str, Any]]] = []
+    gpu_counts: list[str] = []
     for node in ray.nodes():
         if not node.get("Alive", False):
             continue
-
         resources = node.get("Resources") or {}
-        gpu_count = float(resources.get("GPU", 0))
-        if gpu_count <= 0:
-            continue
-        if gpu_count < required_gpus:
-            raise ValueError(
-                f"Ray node {node.get('NodeID')} has {gpu_count:g} GPU resources, "
-                f"but each rollout VLLMServer requires {required_gpus:g}"
-            )
-
+        gpu_count = int(float(resources.get("GPU", 0)))
         node_id = node.get("NodeID")
-        if node_id is not None:
-            node_ids.append(str(node_id))
-
-    return node_ids
+        if node_id is None:
+            continue
+        if gpu_count > 0:
+            gpu_counts.append(f"{node_id}:{gpu_count}")
+        if gpu_count >= gpus_per_node:
+            selected.append((str(node_id), node))
+    if len(selected) < nodes:
+        available = ", ".join(gpu_counts) or "none"
+        raise ValueError(
+            f"Ray has {len(selected)} GPU node(s) with at least {gpus_per_node} GPU(s), "
+            f"but resources.nodes requires {nodes}; available GPU nodes: {available}"
+        )
+    return selected[:nodes]
 
 
 def _split_visible_devices(visible_devices: str) -> list[str]:
     return [device.strip() for device in str(visible_devices).split(",") if device.strip()]
 
 
-def _actor_devices_by_node(actor_mgr: Any | None) -> dict[str, set[str]]:
-    if actor_mgr is None:
-        return {}
-    get_layout = getattr(actor_mgr, "get_colocated_rollout_layout", None)
-    if get_layout is None:
-        return {}
-    visible_devices_by_node, node_ids = get_layout()
-    return {
-        str(node_id): set(_split_visible_devices(visible_devices))
-        for visible_devices, node_id in zip(visible_devices_by_node, node_ids, strict=True)
-    }
-
-
-def _node_gpu_devices(node: dict[str, Any]) -> list[str]:
-    env_devices = _split_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
-    if env_devices:
-        return env_devices
-    resources = node.get("Resources") or {}
-    gpu_count = int(float(resources.get("GPU", 0)))
-    return [str(index) for index in range(gpu_count)]
-
-
-def _rollout_visible_devices(
+def _server_layouts_from_devices(
     config: RolloutConfig,
+    devices: list[str],
     node_id: str | None,
-    actor_devices_by_node: dict[str, set[str]],
-) -> str:
-    if node_id is None or not actor_devices_by_node:
-        return ""
-
-    actor_devices = actor_devices_by_node.get(str(node_id), set())
-    if not actor_devices:
-        return ""
-
-    required_gpus = _required_gpus_per_server(config)
-    if not required_gpus.is_integer():
-        return ""
-
-    nodes = {str(node.get("NodeID")): node for node in ray.nodes() if node.get("NodeID") is not None}
-    node = nodes.get(str(node_id))
-    if node is None:
-        return ""
-
-    free_devices = [device for device in _node_gpu_devices(node) if device not in actor_devices]
-    required = int(required_gpus)
-    if len(free_devices) < required:
+    num_gpus: float,
+) -> list[ServerLayout]:
+    tp_size = int(config.tensor_parallel_size)
+    if not devices:
+        raise RuntimeError("Cannot start rollout because no GPU devices were selected")
+    if len(devices) % tp_size != 0:
         raise ValueError(
-            f"Ray node {node_id} has actor GPU devices {sorted(actor_devices)}, "
-            f"but standalone rollout needs {required} additional GPU(s)"
+            f"rollout node {node_id} has {len(devices)} visible GPU device(s), "
+            "which must be divisible by rollout.tensor_parallel_size"
         )
-    return ",".join(free_devices)
-
-
-def _standalone_server_layouts(
-    config: RolloutConfig,
-    actor_devices_by_node: dict[str, set[str]] | None = None,
-) -> list[tuple[str, str | None]]:
-    actor_devices_by_node = actor_devices_by_node or {}
-    node_ids = _active_gpu_node_ids(config)
-
-    if len(node_ids) > 1:
-        layouts: list[tuple[str, str | None]] = []
-        for node_id in node_ids:
-            visible_devices = _rollout_visible_devices(config, node_id, actor_devices_by_node)
-            if visible_devices:
-                layouts.extend(_colocated_server_layouts(config, [visible_devices], [node_id]))
-            else:
-                layouts.append((visible_devices, node_id))
-        return layouts
-
-    node_id = node_ids[0] if node_ids else None
-    visible_devices = _rollout_visible_devices(config, node_id, actor_devices_by_node)
-    if visible_devices:
-        return _colocated_server_layouts(config, [visible_devices], [node_id])
-    return [(visible_devices, node_id)]
+    return [
+        (",".join(devices[start : start + tp_size]), node_id, num_gpus)
+        for start in range(0, len(devices), tp_size)
+    ]
 
 
 def _colocated_server_layouts(
     config: RolloutConfig,
     visible_devices_by_node: list[str],
     node_ids: list[str] | None,
-) -> list[tuple[str, str | None]]:
-    tp_size = int(config.tensor_parallel_size)
+) -> list[ServerLayout]:
     node_ids = node_ids or [None] * len(visible_devices_by_node)
-    layouts: list[tuple[str, str | None]] = []
-
+    layouts: list[ServerLayout] = []
     for visible_devices, node_id in zip(visible_devices_by_node, node_ids, strict=True):
         devices = _split_visible_devices(visible_devices)
-        if not devices:
-            raise RuntimeError("Cannot colocate rollout because no visible GPU devices were reported")
-        if len(devices) % tp_size != 0:
-            raise ValueError(
-                f"colocated rollout node {node_id} has {len(devices)} visible GPU device(s), "
-                "which must be divisible by rollout.tensor_model_parallel_size"
-            )
-        for start in range(0, len(devices), tp_size):
-            layouts.append((",".join(devices[start : start + tp_size]), node_id))
+        layouts.extend(_server_layouts_from_devices(config, devices, node_id, num_gpus=0.0))
+    return layouts
 
+
+def _standalone_server_layouts(config: SystemConfig, actor_mgr: Any | None = None) -> list[ServerLayout]:
+    _ = actor_mgr
+    resources = config.resources
+    rollout_cfg = config.rollout
+    node_entries = _resource_gpu_nodes(resources.nodes, resources.gpus_per_node)
+    num_gpus = float(rollout_cfg.tensor_parallel_size)
+    layouts: list[ServerLayout] = []
+    for node_id, _node in node_entries[: resources.rollout_nodes]:
+        for _ in range(resources.rollout_servers_per_node):
+            layouts.append(("", node_id, num_gpus))
+    if len(layouts) != resources.rollout_world_size:
+        raise RuntimeError(
+            f"expected {resources.rollout_world_size} rollout server(s), launched {len(layouts)}"
+        )
     return layouts
 
 
@@ -205,6 +148,7 @@ def create_vllm_server(
     server_rank: int,
     visible_devices: str,
     node_id: str | None = None,
+    num_gpus: float = 0.0,
 ) -> Any:
     _apply_vllm_server_env_defaults()
     from nanoverl.rollout.vllm_server import VLLMServer
@@ -212,11 +156,7 @@ def create_vllm_server(
     options: dict[str, Any] = {}
     if config.ray_num_cpus_per_server > 0:
         options["num_cpus"] = float(config.ray_num_cpus_per_server)
-    num_gpus = config.ray_num_gpus_per_server
-    if num_gpus is None:
-        visible_gpu_count = len(_split_visible_devices(visible_devices))
-        num_gpus = float(visible_gpu_count or config.tensor_parallel_size)
-    if num_gpus is not None and num_gpus > 0:
+    if num_gpus > 0:
         options["num_gpus"] = float(num_gpus)
 
     if node_id is not None:
@@ -290,7 +230,9 @@ class RolloutManager:
         actor_mgr: Any | None = None,
     ) -> "RolloutManager":
         _ = tokenizer
-        rollout_cfg = config.rollout if isinstance(config, SystemConfig) else config
+        if not isinstance(config, SystemConfig):
+            raise TypeError("RolloutManager.launch requires SystemConfig so resources can be used")
+        rollout_cfg = config.rollout
         if not ray.is_initialized():
             init_kwargs: dict[str, Any] = {
                 "ignore_reinit_error": True,
@@ -301,22 +243,23 @@ class RolloutManager:
                 init_kwargs["address"] = rollout_cfg.ray_address
             ray.init(**init_kwargs)
 
-        visible_devices_by_node = [""]
-        node_ids = None
-        if rollout_cfg.colocate_with_actor:
+        if rollout_cfg.mode.lower().strip() == "hybrid":
             if actor_mgr is None:
-                raise ValueError("rollout.colocate_with_actor requires an initialized ActorManager")
+                raise ValueError("rollout.mode='hybrid' requires an initialized ActorManager")
             visible_devices_by_node, node_ids = actor_mgr.get_colocated_rollout_layout()
             print(
-                f"[rollout] colocate_with_actor visible_devices_by_node={visible_devices_by_node}",
+                f"[rollout] hybrid visible_devices_by_node={visible_devices_by_node}",
                 flush=True,
             )
+            server_layouts = _colocated_server_layouts(rollout_cfg, visible_devices_by_node, node_ids)
+        else:
+            server_layouts = _standalone_server_layouts(config, actor_mgr)
+        if len(server_layouts) != config.resources.rollout_world_size:
+            raise RuntimeError(
+                f"expected {config.resources.rollout_world_size} rollout server(s), "
+                f"launched {len(server_layouts)}"
+            )
 
-        server_layouts = (
-            _colocated_server_layouts(rollout_cfg, visible_devices_by_node, node_ids)
-            if rollout_cfg.colocate_with_actor
-            else _standalone_server_layouts(rollout_cfg, _actor_devices_by_node(actor_mgr))
-        )
         servers = {
             str(server_rank): create_vllm_server(
                 config=rollout_cfg,
@@ -324,8 +267,9 @@ class RolloutManager:
                 server_rank=server_rank,
                 visible_devices=visible_devices,
                 node_id=node_id,
+                num_gpus=num_gpus,
             )
-            for server_rank, (visible_devices, node_id) in enumerate(server_layouts)
+            for server_rank, (visible_devices, node_id, num_gpus) in enumerate(server_layouts)
         }
         load_balancer = LoadBalancer.remote(config=rollout_cfg, servers=servers)
         return cls(

@@ -350,7 +350,7 @@ class Trainer:
                 keep_indices = keep_mask.nonzero(as_tuple=False).flatten().cpu().tolist()
                 if 0 < len(keep_indices) < len(actor_batch):
                     actor_batch = actor_batch[keep_indices]
-        actor_batch = self._pad_actor_update_batch(actor_batch, self.system_cfg.distributed.dp_size)
+        actor_batch = self._pad_actor_update_batch(actor_batch, self.system_cfg.resources.actor_world_size)
         return actor_batch, skipped
 
     def _actor_update_is_noop(self, batch: DataProto) -> bool:
@@ -372,12 +372,12 @@ class Trainer:
         return algorithms.compute_advantage(batch, self.experiment_cfg)
 
     def balance_batch(self, batch: DataProto) -> DataProto:
-        if self.system_cfg.distributed.dp_size <= 1:
+        if self.system_cfg.resources.actor_world_size <= 1:
             return batch
         total_len = batch.batch["prompt_attention_mask"].sum(dim=1)
         if "response_mask" in batch.batch:
             total_len = total_len + batch.batch["response_mask"].sum(dim=1)
-        partitions = self._balanced_partitions(total_len.tolist(), self.system_cfg.distributed.dp_size)
+        partitions = self._balanced_partitions(total_len.tolist(), self.system_cfg.resources.actor_world_size)
         order = [index for partition in partitions for index in partition]
         return batch[order]
 
@@ -523,7 +523,7 @@ class Trainer:
             train_timing["train_advantage"] = time.perf_counter() - started
         started = time.perf_counter()
         batch = self.balance_batch(batch)
-        batch, pad_size = self.pad_batch(batch, self.system_cfg.distributed.dp_size)
+        batch, pad_size = self.pad_batch(batch, self.system_cfg.resources.actor_world_size)
         train_timing["train_balance_pad"] = time.perf_counter() - started
         started = time.perf_counter()
         actor_update_noop = False if need_ref_log_prob else self._actor_update_is_noop(batch)
@@ -551,7 +551,7 @@ class Trainer:
             started = time.perf_counter()
             batch = self.unpad_batch(batch, pad_size)
             batch = self.compute_advantage(batch)
-            batch, pad_size = self.pad_batch(batch, self.system_cfg.distributed.dp_size)
+            batch, pad_size = self.pad_batch(batch, self.system_cfg.resources.actor_world_size)
             train_timing["train_advantage"] = time.perf_counter() - started
         started = time.perf_counter()
         metrics_list: list[tuple[dict[str, float], float]] = []
