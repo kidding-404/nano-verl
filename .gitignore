@@ -40,3 +40,7 @@ experiment/
 scripts/
 tests/
 uv.lock
+
+# Hidden files and directories
+.*
+!.gitignore
