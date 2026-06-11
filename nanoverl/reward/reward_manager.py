@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -8,13 +7,6 @@ import torch
 
 from nanoverl.data import DataProto
 
-
-def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
-    if config is None:
-        return default
-    if isinstance(config, Mapping):
-        return config.get(key, default)
-    return getattr(config, key, default)
 
 
 def _compute_reward_task(task: tuple[Callable[..., float], Any, str, Any, dict[str, Any]]) -> float:
@@ -38,8 +30,6 @@ class RewardManager:
         num_workers: int = 1,
         parallel_backend: str = "thread",
         logger: Any | None = None,
-        max_resp_len: int | None = None,
-        overlong_buffer_cfg: Any | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.reward_fn = reward_fn
@@ -49,19 +39,6 @@ class RewardManager:
         if self.parallel_backend not in {"thread", "process"}:
             raise ValueError(f"Unsupported reward parallel backend: {parallel_backend}")
         self.logger = logger
-        self.max_resp_len = int(max_resp_len) if max_resp_len is not None else None
-        self.overlong_buffer_cfg = overlong_buffer_cfg
-        self.overlong_buffer_enabled = bool(_cfg_get(overlong_buffer_cfg, "enable", False))
-        self.overlong_buffer_len = int(_cfg_get(overlong_buffer_cfg, "len", 0) or 0)
-        self.overlong_penalty_factor = float(_cfg_get(overlong_buffer_cfg, "penalty_factor", 1.0))
-        self.overlong_log = bool(_cfg_get(overlong_buffer_cfg, "log", False))
-        if overlong_buffer_cfg is not None:
-            if self.max_resp_len is None:
-                raise ValueError("max_resp_len must be provided when overlong_buffer_cfg is set")
-            if self.max_resp_len < self.overlong_buffer_len:
-                raise ValueError("max_resp_len must be greater than or equal to overlong_buffer_cfg.len")
-            if self.overlong_buffer_enabled and self.overlong_buffer_len <= 0:
-                raise ValueError("overlong_buffer_cfg.len must be positive when overlong penalty is enabled")
 
     def _decode_solution_strs(self, batch: DataProto) -> list[str]:
         response_texts = batch.non_tensor_batch.get("response_text")
@@ -117,19 +94,6 @@ class RewardManager:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             return list(executor.map(lambda item: self._compute_one_reward(*item), reward_inputs))
 
-    def _response_lengths(self, batch: DataProto, size: int) -> list[int | None]:
-        response_mask = batch.batch.get("response_mask")
-        if response_mask is None:
-            return [None] * size
-        return [int(value) for value in response_mask.detach().cpu().sum(dim=1).tolist()]
-
-    def _overlong_reward(self, response_length: int | None) -> float:
-        if not self.overlong_buffer_enabled or response_length is None:
-            return 0.0
-        expected_len = self.max_resp_len - self.overlong_buffer_len
-        exceed_len = response_length - expected_len
-        return float(min(-exceed_len / self.overlong_buffer_len * self.overlong_penalty_factor, 0.0))
-
     def _log_samples(
         self,
         batch: DataProto,
@@ -160,23 +124,12 @@ class RewardManager:
             for idx, solution_str in enumerate(solution_strs)
         ]
         base_rewards = self._compute_base_rewards(reward_inputs)
-        response_lengths = self._response_lengths(batch, len(solution_strs))
         rewards: list[float] = []
         details: list[dict[str, Any]] = []
-        for base_reward, response_length in zip(base_rewards, response_lengths, strict=True):
-            overlong_reward = self._overlong_reward(response_length)
-            reward = float(base_reward + overlong_reward)
-            detail: dict[str, Any] = {"reward": reward}
-            if self.overlong_log:
-                detail.update(
-                    {
-                        "base_reward": float(base_reward),
-                        "overlong_reward": overlong_reward,
-                        "overlong": overlong_reward < 0,
-                    }
-                )
+        for base_reward in base_rewards:
+            reward = float(base_reward)
             rewards.append(reward)
-            details.append(detail)
+            details.append({"reward": reward})
         self._log_samples(batch, solution_strs, rewards)
         reward_proto = DataProto.from_dict(
             {"rewards": torch.tensor(rewards, dtype=torch.float32)},

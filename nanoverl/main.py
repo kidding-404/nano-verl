@@ -78,7 +78,6 @@ def load_reward_fn(
             raise AttributeError(f"Reward module {module_path} has no function {custom_cfg.name}")
     reward_fn = score_fn or default_compute_score
     reward_kwargs = dict(experiment_cfg.reward.kwargs)
-    overlong_buffer_cfg = reward_kwargs.get("overlong_buffer_cfg")
     num_workers = int(reward_kwargs.get("num_workers", 1))
     parallel_backend = str(reward_kwargs.get("parallel_backend", "thread"))
     parallel_backend = str(getattr(reward_fn, _REWARD_PARALLEL_BACKEND_ATTR, parallel_backend))
@@ -92,8 +91,6 @@ def load_reward_fn(
         num_workers=num_workers,
         parallel_backend=parallel_backend,
         logger=logger,
-        max_resp_len=int(reward_kwargs.get("max_resp_len", experiment_cfg.algorithm.max_new_tokens)),
-        overlong_buffer_cfg=overlong_buffer_cfg,
     )
 
 
